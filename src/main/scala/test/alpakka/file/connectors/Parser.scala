@@ -1,5 +1,6 @@
 package test.alpakka.file.connectors
 
+import java.io.File
 import java.nio.file.FileSystems
 
 import akka.NotUsed
@@ -17,7 +18,7 @@ class Parser extends Actor {
 
   import context.dispatcher
 
-  implicit val mat = ActorMaterializer()
+  implicit val mat: ActorMaterializer = ActorMaterializer()
   val fileName = "resources/file"
 
   //  override def persistenceId: String = "parser"
@@ -41,14 +42,15 @@ class Parser extends Actor {
   //    case str: String => println(str)
   //  }
 
+  var offset = 0l
+
   val fs = FileSystems.getDefault
-    FileTailSource(
-      path = fs.getPath(fileName),
-      maxChunkSize = 20,
-      startingPosition = 0,
-      pollingInterval = 250.millis
-    )
-//  FileIO.fromPath(fs.getPath(fileName), 8192, 0)
+  FileTailSource(
+    path = fs.getPath(fileName),
+    maxChunkSize = 0,
+    startingPosition = offset,
+    pollingInterval = 250.millis
+  )
     .via(Framing.delimiter(ByteString("\n"), 100, true))
     .map(_.utf8String)
     .runForeach(self ! _)
@@ -56,9 +58,10 @@ class Parser extends Actor {
       case Success(value) => println(s"stream ended. $value")
       case Failure(ex)    => ex.printStackTrace()
     }
-  //    .foreach(_ => println("stream ended"))
 
   override def receive: Receive = {
-    case str: String => println(str)
+    case str: String =>
+      offset += str.length + 1
+      println(s"str $str offset $offset")
   }
 }
