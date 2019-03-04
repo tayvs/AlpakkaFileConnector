@@ -12,8 +12,8 @@ import akka.stream.alpakka.file.scaladsl.FileTailSource
 import akka.stream.scaladsl.{FileIO, Flow, Framing, Keep, Sink}
 import akka.util.{ByteString, Timeout}
 import test.alpakka.file.connectors.Parser.Commands.{ChangeFile, Lines}
-import test.alpakka.file.connectors.Parser.Events.{FileChanged, IncOffset}
-import test.alpakka.file.connectors.Parser.State.CurrentFile
+import test.alpakka.file.connectors.Parser.Events.{FileChanged, FileReaded, IncOffset}
+import test.alpakka.file.connectors.Parser.State.{CurrentFile, CurrentWithHistory}
 import test.alpakka.file.connectors.Parser._
 import test.alpakka.file.connectors.Parser.StreamControl._
 
@@ -33,12 +33,42 @@ class Parser extends PersistentActor with ActorLogging {
   implicit val mat: ActorMaterializer = ActorMaterializer()
   implicit val timeout: Timeout = Timeout(2 seconds)
 
-  var currentFile = CurrentFile(FileCursor(fs.getPath(fileName), 0l), initCurrentReader(fs.getPath(fileName), 0l))
+  var state: State = {
+    val path = fs.getPath(fileName)
+    CurrentFile(FileCursor(path), initCurrentReader(path))
+  }
 
-  def updateState(ev: PersistedEvents): Unit = currentFile = ev match {
-    case cf: State.CurrentFile        => cf.copy(control = initCurrentReader(cf.cursor))
-    case IncOffset(path, offsetDelta) => currentFile.copy(cursor = currentFile.cursor.copy(offset = currentFile.cursor.offset + offsetDelta))
-    case FileChanged(newPath)         => currentFile.copy(cursor = FileCursor(newPath))
+  /** */
+  def updateState(ev: PersistedEvents): Unit =
+    state = updateSnapshot().orElse(state match {
+      case State.EmptyState         => updateEmptyState()
+      case cf: CurrentFile          => updateActiveState(cf)
+      case cfwh: CurrentWithHistory => updateActiveWithHistoryState(cfwh)
+    })(ev)
+
+  def updateActiveState(currentFile: CurrentFile): PartialFunction[PersistedEvents, State] = {
+    case IncOffset(path, offsetDelta)
+      if currentFile.cursor.path == path => currentFile.copy(cursor = currentFile.cursor.copy(offset = currentFile.cursor.offset + offsetDelta))
+    case FileChanged(newPath)            => CurrentFile(cursor = FileCursor(newPath), control = initCurrentReader(FileCursor(newPath)))
+  }
+
+  def updateEmptyState(): PartialFunction[PersistedEvents, State] = {
+    case FileChanged(newPath) => CurrentFile(cursor = FileCursor(newPath), control = initCurrentReader(FileCursor(newPath)))
+  }
+
+  def updateActiveWithHistoryState(activeWithHistory: CurrentWithHistory): PartialFunction[PersistedEvents, State] = {
+    case FileChanged(newPath)                          => activeWithHistory.copy(current = CurrentFile(cursor = FileCursor(newPath), control = initCurrentReader(FileCursor(newPath))))
+    case IncOffset(path, offsetDelta)
+      if activeWithHistory.current.cursor.path == path => activeWithHistory.copy(current = activeWithHistory.current.copy(cursor = activeWithHistory.current.cursor.copy(offset = activeWithHistory.current.cursor.offset + offsetDelta)))
+    case IncOffset(path, offsetDelta)
+      if activeWithHistory.history.contains(path)      => activeWithHistory.copy(history = activeWithHistory.history.updated(path, activeWithHistory.history(path).copy(offset = activeWithHistory.history(path).offset + offsetDelta)))
+    case FileReaded(path)                              => activeWithHistory.copy(history = activeWithHistory.history - path)
+  }
+
+  def updateSnapshot(): PartialFunction[PersistedEvents, State] = {
+    case State.EmptyState                                    => State.EmptyState
+    case CurrentFile(cursor, _)                              => CurrentFile(cursor, initCurrentReader(cursor))
+    case CurrentWithHistory(history, CurrentFile(cursor, _)) => CurrentWithHistory(history, CurrentFile(cursor, initCurrentReader(cursor)))
   }
 
   override def receiveRecover: Receive = {
@@ -46,18 +76,14 @@ class Parser extends PersistentActor with ActorLogging {
   }
 
   def streamControlReceive: Receive = {
-    case Init     => sender() ! Ack
-    case Complete => log.warning(s"Current file ${currentFile.cursor.path} listening ended")
-  }
-
-  override def receiveCommand: Receive = {
-    case str: String         =>
-      persist(IncOffset(currentFile.cursor.path, str.length + 1)) { ev =>
+    case Init               => sender() ! Ack
+    case TailingCompleted   => log.warning(s"Current file $state listening ended")
+    case fr: FileReaded     =>
+      persist(fr) { ev =>
         updateState(ev)
-        sender ! Ok
-        println(s"str $str. $currentFile")
+        sender ! Ack
       }
-    case Lines(path, lines)  =>
+    case Lines(path, lines) =>
       lines.foreach { str =>
         persist(IncOffset(path, str.length + 1)) { ev =>
           updateState(ev)
@@ -66,6 +92,9 @@ class Parser extends PersistentActor with ActorLogging {
         }
       }
       defer(()) { _ => sender() ! Ack }
+  }
+
+  override def receiveCommand: Receive = {
     case ChangeFile(newPath) =>
       persist(FileChanged(newPath)) { ev =>
         updateState(ev)
@@ -82,7 +111,8 @@ class Parser extends PersistentActor with ActorLogging {
       startingPosition = offset,
       pollingInterval = 250.millis
     )
-      .toMat(processingSink(path))(Keep.right)
+      .viaMat(processing(path))(Keep.right)
+      .toMat(Sink.actorRefWithAck(self, Init, Ack, TailingCompleted))(Keep.left)
       .run()
 
   def initHistoryReader(fileCursor: FileCursor): UniqueKillSwitch = initHistoryReader(fileCursor.path, fileCursor.offset)
@@ -90,16 +120,16 @@ class Parser extends PersistentActor with ActorLogging {
   def initHistoryReader(path: Path, offset: Long = 0l): UniqueKillSwitch =
     FileIO
       .fromPath(path, 8192, offset)
-      .toMat(processingSink(path))(Keep.right)
+      .viaMat(processing(path))(Keep.right)
+      .toMat(Sink.actorRefWithAck(self, Init, Ack, FileReaded(path)))(Keep.left)
       .run()
 
-  def processingSink(path: Path): Sink[ByteString, UniqueKillSwitch] = Flow[ByteString]
+  def processing(path: Path): Flow[ByteString, Lines, UniqueKillSwitch] = Flow[ByteString]
     .via(Framing.delimiter(ByteString("\n"), Int.MaxValue))
     .map(_.utf8String)
     .groupedWithin(100, 250.millis)
     .map(Lines(path, _))
     .viaMat(KillSwitches.single)(Keep.right)
-    .toMat(Sink.actorRefWithAck(self, Init, Ack, Complete))(Keep.left)
 }
 
 object Parser {
@@ -112,7 +142,7 @@ object Parser {
 
     case object Ack extends StreamControl
 
-    case object Complete extends StreamControl
+    case object TailingCompleted extends StreamControl with Events
 
   }
 
@@ -128,6 +158,8 @@ object Parser {
 
     case class FileChanged(newPath: Path) extends Events
 
+    case class FileReaded(path: Path) extends Events
+
   }
 
   sealed trait State extends PersistedEvents
@@ -140,7 +172,7 @@ object Parser {
 
     case class CurrentFile(cursor: FileCursor, control: UniqueKillSwitch) extends State
 
-    case class CurrentWithHistory(history: Map[Path, FileCursor]) extends State
+    case class CurrentWithHistory(history: Map[Path, FileCursor], current: CurrentFile) extends State
 
   }
 
