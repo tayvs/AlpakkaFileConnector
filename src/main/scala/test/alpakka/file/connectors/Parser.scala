@@ -47,28 +47,35 @@ class Parser extends PersistentActor with ActorLogging {
     })(ev)
 
   def updateActiveState(currentFile: CurrentFile): PartialFunction[PersistedEvents, State] = {
-    case IncOffset(path, offsetDelta)
-      if currentFile.cursor.path == path => currentFile.copy(cursor = currentFile.cursor.copy(offset = currentFile.cursor.offset + offsetDelta))
-    case FileChanged(newPath)            => CurrentFile(cursor = FileCursor(newPath), control = initCurrentReader(FileCursor(newPath)))
+    case IncOffset(path, offsetDelta) if currentFile.cursor.path == path =>
+      val cursor = currentFile.cursor
+      currentFile.copy(cursor = cursor.copy(offset = cursor.offset + offsetDelta))
+    case FileChanged(newPath)                                            =>
+      CurrentFile(cursor = FileCursor(newPath), control = initCurrentReader(FileCursor(newPath)))
   }
 
   def updateEmptyState(): PartialFunction[PersistedEvents, State] = {
-    case FileChanged(newPath) => CurrentFile(cursor = FileCursor(newPath), control = initCurrentReader(FileCursor(newPath)))
+    case FileChanged(newPath) => CurrentFile(cursor = FileCursor(newPath), control = initCurrentReader(newPath))
   }
 
   def updateActiveWithHistoryState(activeWithHistory: CurrentWithHistory): PartialFunction[PersistedEvents, State] = {
-    case FileChanged(newPath)                          => activeWithHistory.copy(current = CurrentFile(cursor = FileCursor(newPath), control = initCurrentReader(FileCursor(newPath))))
-    case IncOffset(path, offsetDelta)
-      if activeWithHistory.current.cursor.path == path => activeWithHistory.copy(current = activeWithHistory.current.copy(cursor = activeWithHistory.current.cursor.copy(offset = activeWithHistory.current.cursor.offset + offsetDelta)))
-    case IncOffset(path, offsetDelta)
-      if activeWithHistory.history.contains(path)      => activeWithHistory.copy(history = activeWithHistory.history.updated(path, activeWithHistory.history(path).copy(offset = activeWithHistory.history(path).offset + offsetDelta)))
-    case FileReaded(path)                              => activeWithHistory.copy(history = activeWithHistory.history - path)
+    case FileChanged(newPath)                                                          =>
+      activeWithHistory.copy(current = CurrentFile(FileCursor(newPath), initCurrentReader(newPath)))
+    case IncOffset(path, offsetDelta) if activeWithHistory.current.cursor.path == path =>
+      val cursor = activeWithHistory.current.cursor
+      activeWithHistory.copy(current = activeWithHistory.current.copy(cursor = cursor.copy(offset = cursor.offset + offsetDelta)))
+    case IncOffset(path, offsetDelta) if activeWithHistory.history.contains(path)      =>
+      val recordForUpdating = activeWithHistory.history(path)
+      val updatedRecord = recordForUpdating.copy(offset = recordForUpdating.offset + offsetDelta)
+      activeWithHistory.copy(history = activeWithHistory.history.updated(path, updatedRecord))
+    case FileReaded(path)                                                              =>
+      activeWithHistory.copy(history = activeWithHistory.history - path)
   }
 
   def updateSnapshot(): PartialFunction[PersistedEvents, State] = {
-    case State.EmptyState                                    => State.EmptyState
-    case CurrentFile(cursor, _)                              => CurrentFile(cursor, initCurrentReader(cursor))
-    case CurrentWithHistory(history, CurrentFile(cursor, _)) => CurrentWithHistory(history, CurrentFile(cursor, initCurrentReader(cursor)))
+    case State.EmptyState                                       => State.EmptyState
+    case CurrentFile(cursor, _)                                 => CurrentFile(cursor, initCurrentReader(cursor))
+    case CurrentWithHistory(history, cf@CurrentFile(cursor, _)) => CurrentWithHistory(history, cf.copy(control = initCurrentReader(cursor)))
   }
 
   override def receiveRecover: Receive = {
