@@ -39,14 +39,14 @@ class Parser extends PersistentActor with ActorLogging {
   }
 
   /** */
-  def updateState(ev: PersistedEvents): Unit =
-    state = updateSnapshot().orElse(state match {
+  def updateState(ev: Events): Unit =
+    state = (state match {
       case State.EmptyState         => updateEmptyState()
       case cf: CurrentFile          => updateActiveState(cf)
       case cfwh: CurrentWithHistory => updateActiveWithHistoryState(cfwh)
-    })(ev)
+    }) (ev)
 
-  def updateActiveState(currentFile: CurrentFile): PartialFunction[PersistedEvents, State] = {
+  def updateActiveState(currentFile: CurrentFile): PartialFunction[Events, State] = {
     case IncOffset(path, offsetDelta) if currentFile.cursor.path == path =>
       val cursor = currentFile.cursor
       currentFile.copy(cursor = cursor.copy(offset = cursor.offset + offsetDelta))
@@ -54,11 +54,11 @@ class Parser extends PersistentActor with ActorLogging {
       CurrentFile(cursor = FileCursor(newPath), control = initCurrentReader(FileCursor(newPath)))
   }
 
-  def updateEmptyState(): PartialFunction[PersistedEvents, State] = {
+  def updateEmptyState(): PartialFunction[Events, State] = {
     case FileChanged(newPath) => CurrentFile(cursor = FileCursor(newPath), control = initCurrentReader(newPath))
   }
 
-  def updateActiveWithHistoryState(activeWithHistory: CurrentWithHistory): PartialFunction[PersistedEvents, State] = {
+  def updateActiveWithHistoryState(activeWithHistory: CurrentWithHistory): PartialFunction[Events, State] = {
     case FileChanged(newPath)                                                          =>
       activeWithHistory.copy(current = CurrentFile(FileCursor(newPath), initCurrentReader(newPath)))
     case IncOffset(path, offsetDelta) if activeWithHistory.current.cursor.path == path =>
@@ -72,14 +72,11 @@ class Parser extends PersistentActor with ActorLogging {
       activeWithHistory.copy(history = activeWithHistory.history - path)
   }
 
-  def updateSnapshot(): PartialFunction[PersistedEvents, State] = {
-    case State.EmptyState                                       => State.EmptyState
-    case CurrentFile(cursor, _)                                 => CurrentFile(cursor, initCurrentReader(cursor))
-    case CurrentWithHistory(history, cf@CurrentFile(cursor, _)) => CurrentWithHistory(history, cf.copy(control = initCurrentReader(cursor)))
-  }
-
   override def receiveRecover: Receive = {
-    case ev: PersistedEvents => updateState(ev)
+    case State.EmptyState                                     => State.EmptyState
+    case CurrentFile(cursor, _)                               => CurrentFile(cursor, initCurrentReader(cursor))
+    case cwh@CurrentWithHistory(_, cf@CurrentFile(cursor, _)) => cwh.copy(current = cf.copy(control = initCurrentReader(cursor)))
+    case ev: Events                                           => updateState(ev)
   }
 
   def streamControlReceive: Receive = {
@@ -155,9 +152,7 @@ object Parser {
 
   case object Ok
 
-  sealed trait PersistedEvents
-
-  sealed trait Events extends PersistedEvents
+  sealed trait Events
 
   object Events {
 
@@ -169,7 +164,7 @@ object Parser {
 
   }
 
-  sealed trait State extends PersistedEvents
+  sealed trait State
 
   case class FileCursor(path: Path, offset: Long = 0l)
 
